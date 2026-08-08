@@ -230,6 +230,13 @@ pub struct World {
     pub block_entities: DashMap<Vector2<i32>, FxHashMap<BlockPos, Arc<dyn BlockEntity>>>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum BlockBreakingProgress {
+    Start { stage: i32, speed: f32 },
+    Update { stage: i32, speed: Option<f32> },
+    Stop,
+}
+
 impl PartialEq for World {
     fn eq(&self, other: &Self) -> bool {
         self.uuid == other.uuid
@@ -272,7 +279,7 @@ impl World {
                 chunk
                     .heightmap
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get(height_map, x, z, self.min_y)
             })
             .await
@@ -721,7 +728,7 @@ impl World {
                             skin_parts,
                         ),
                     ] {
-                        meta.write(&mut buf, &version).unwrap();
+                        let _ = meta.write(&mut buf, &version);
                     }
                     buf.put_u8(255);
                     client
@@ -1054,7 +1061,11 @@ impl World {
             block_entity_future
         );
 
-        self.level.chunk_loading.lock().unwrap().send_change();
+        self.level
+            .chunk_loading
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .send_change();
 
         if let Some(ref fight_mutex) = self.dragon_fight {
             dragon_fight::DragonFight::tick(fight_mutex, self).await;
@@ -1695,12 +1706,16 @@ impl World {
             let delta = Vector3::new(rand_value & 15, rand_value >> 16 & 15, rand_value >> 8 & 15);
             let random_pos = Vector3::new(
                 chunk_pos.x << 4,
-                chunk.heightmap.lock().unwrap().get(
-                    MotionBlocking,
-                    chunk_pos.x << 4,
-                    chunk_pos.y << 4,
-                    self.min_y,
-                ),
+                chunk
+                    .heightmap
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(
+                        MotionBlocking,
+                        chunk_pos.x << 4,
+                        chunk_pos.y << 4,
+                        self.min_y,
+                    ),
                 chunk_pos.y << 4,
             )
             .add(&delta);
@@ -1830,12 +1845,16 @@ impl World {
 
         self.level
             .read_chunk_sync(&chunk_pos, |chunk| {
-                let height = chunk.heightmap.lock().unwrap().get(
-                    ChunkHeightmapType::WorldSurface,
-                    position.x,
-                    position.y,
-                    self.dimension.min_y,
-                );
+                let height = chunk
+                    .heightmap
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(
+                        ChunkHeightmapType::WorldSurface,
+                        position.x,
+                        position.y,
+                        self.dimension.min_y,
+                    );
 
                 if height >= self.dimension.min_y {
                     return height;
@@ -1863,7 +1882,7 @@ impl World {
                 chunk
                     .heightmap
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get(height_map, x, z, self.min_y)
             })
             .unwrap_or(self.min_y)
@@ -2639,7 +2658,7 @@ impl World {
                     .java
                     .max_players
                     .try_into()
-                    .unwrap(),
+                    .unwrap_or(u16::MAX.into()),
                 server
                     .advanced_config
                     .networking
@@ -3103,7 +3122,7 @@ impl World {
                         MetaDataType::BYTE,
                         config.skin_parts,
                     );
-                    meta.write(&mut buf, &client.version.load()).unwrap();
+                    let _ = meta.write(&mut buf, &client.version.load());
                 };
                 {
                     let meta = Metadata::new(
@@ -3111,7 +3130,7 @@ impl World {
                         MetaDataType::BYTE,
                         config.skin_parts,
                     );
-                    meta.write(&mut buf, &client.version.load()).unwrap();
+                    let _ = meta.write(&mut buf, &client.version.load());
                 };
                 drop(config);
                 // END
@@ -3978,8 +3997,7 @@ impl World {
                     .pos
                     .load()
                     .squared_distance_to_vec(&pos)
-                    .partial_cmp(&b.get_entity().pos.load().squared_distance_to_vec(&pos))
-                    .unwrap()
+                    .total_cmp(&b.get_entity().pos.load().squared_distance_to_vec(&pos))
             })
             .cloned()
     }
@@ -4025,8 +4043,7 @@ impl World {
                     .pos
                     .load()
                     .squared_distance_to_vec(&pos)
-                    .partial_cmp(&b.1.get_entity().pos.load().squared_distance_to_vec(&pos))
-                    .unwrap()
+                    .total_cmp(&b.1.get_entity().pos.load().squared_distance_to_vec(&pos))
             })
             .map(|p| p.1.clone())
     }
@@ -4318,33 +4335,61 @@ impl World {
         }
     }
 
-    pub async fn set_block_breaking(&self, from: &Entity, location: BlockPos, progress: i32) {
+    pub(crate) async fn set_block_breaking(
+        &self,
+        from: &Entity,
+        location: BlockPos,
+        progress: BlockBreakingProgress,
+    ) {
         let chunk_pos = location.chunk_position(); // pumpkin's BlockPos already has this method
-        let je_packet = CSetBlockDestroyStage::new(from.entity_id.into(), location, progress as i8);
-
-        let (event_id, data) = match progress {
-            -1 => (LevelEvent::BlockStopBreak, 0),
-            0 => (LevelEvent::BlockStartBreak, 0),
-            _ => (LevelEvent::BlockUpdateBreak, progress),
-        };
-
-        let be_packet = CLevelEvent {
-            event_id: VarInt(event_id as i32),
-            position: Vector3::new(
-                location.0.x as f32,
-                location.0.y as f32,
-                location.0.z as f32,
+        let (stage, bedrock_event) = match progress {
+            BlockBreakingProgress::Start { stage, speed } => (
+                stage,
+                Some((
+                    LevelEvent::BlockStartBreak,
+                    bedrock_block_breaking_rate(speed),
+                )),
             ),
-            data: VarInt(data),
+            BlockBreakingProgress::Update { stage, speed } => (
+                stage,
+                speed.map(|speed| {
+                    (
+                        LevelEvent::BlockUpdateBreak,
+                        bedrock_block_breaking_rate(speed),
+                    )
+                }),
+            ),
+            BlockBreakingProgress::Stop => (-1, Some((LevelEvent::BlockStopBreak, 0))),
         };
+        let je_packet = CSetBlockDestroyStage::new(from.entity_id.into(), location, stage as i8);
 
-        self.broadcast_to_chunk_except_editioned(
-            chunk_pos,
-            &[from.entity_uuid],
-            &je_packet,
-            &be_packet,
-        )
-        .await;
+        if let Some((event_id, data)) = bedrock_event {
+            let be_packet = CLevelEvent {
+                event_id: VarInt(event_id as i32),
+                position: Vector3::new(
+                    location.0.x as f32,
+                    location.0.y as f32,
+                    location.0.z as f32,
+                ),
+                data: VarInt(data),
+            };
+
+            if let Some(player) = self.get_player_by_uuid(from.entity_uuid)
+                && let ClientPlatform::Bedrock(client) = player.client.as_ref()
+            {
+                client.enqueue_packet(&be_packet).await;
+            }
+
+            self.broadcast_to_chunk_except_editioned(
+                chunk_pos,
+                &[from.entity_uuid],
+                &je_packet,
+                &be_packet,
+            )
+            .await;
+        } else {
+            self.broadcast_to_chunk_except(chunk_pos, &[from.entity_uuid], &je_packet);
+        }
     }
 
     /// Sets a block and returns the old block id
@@ -4638,22 +4683,40 @@ impl World {
             });
 
             if Block::from_state_id(broken_state_id) != &Block::FIRE {
-                let particles_packet = CWorldEvent::new(
+                let je_particles_packet = CWorldEvent::new(
                     WorldEvent::ParticlesDestroyBlock as i32,
                     *position,
                     broken_state_id.as_u16().into(),
                     false,
                 );
+                let be_particles_packet = CLevelEvent {
+                    event_id: VarInt(LevelEvent::ParticlesDestroyBlock as i32),
+                    position: Vector3::new(
+                        position.0.x as f32,
+                        position.0.y as f32,
+                        position.0.z as f32,
+                    ),
+                    data: VarInt(BlockState::to_be_network_id(broken_state_id).into()),
+                };
                 let chunk_pos = position.chunk_position();
                 match &cause {
                     Some(player) => {
-                        self.broadcast_to_chunk_except(
+                        if let ClientPlatform::Bedrock(client) = player.client.as_ref() {
+                            client.enqueue_packet(&be_particles_packet).await;
+                        }
+                        self.broadcast_to_chunk_except_editioned(
                             chunk_pos,
                             &[player.get_entity().entity_uuid],
-                            &particles_packet,
-                        );
+                            &je_particles_packet,
+                            &be_particles_packet,
+                        )
+                        .await;
                     }
-                    None => self.broadcast_to_chunk(chunk_pos, &particles_packet),
+                    None => self.broadcast_to_chunk_editioned_sync(
+                        chunk_pos,
+                        &je_particles_packet,
+                        &be_particles_packet,
+                    ),
                 }
             }
             if !flags.contains(BlockFlags::SKIP_DROPS) {
@@ -5108,7 +5171,7 @@ impl World {
                 chunk
                     .pending_block_entities
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(block_pos)
             })
             .flatten()?;
@@ -5163,7 +5226,7 @@ impl World {
                 chunk
                     .pending_block_entities
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(block_pos, nbt.clone());
                 chunk.mark_dirty(true);
             });
@@ -5194,7 +5257,7 @@ impl World {
                 chunk
                     .pending_block_entities
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .keys()
                     .copied()
                     .collect()
@@ -5564,6 +5627,10 @@ impl BlockAccessor for World {
     }
 }
 
+fn bedrock_block_breaking_rate(speed: f32) -> i32 {
+    (speed.clamp(0.0, 1.0) * f32::from(u16::MAX)) as i32
+}
+
 pub struct WorldPortal(pub Arc<World>);
 
 // Pure Beauty :cap:
@@ -5638,5 +5705,17 @@ impl WorldPortalExt for WorldPortal {
                 world.spawn_entity(entity).await;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bedrock_block_breaking_rate;
+
+    #[test]
+    fn bedrock_block_breaking_rate_uses_progress_per_tick() {
+        assert_eq!(bedrock_block_breaking_rate(0.0), 0);
+        assert_eq!(bedrock_block_breaking_rate(1.0 / 30.0), 2_184);
+        assert_eq!(bedrock_block_breaking_rate(1.0), 65_535);
     }
 }

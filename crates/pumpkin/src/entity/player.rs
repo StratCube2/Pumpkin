@@ -105,7 +105,7 @@ use crate::plugin::player::player_permission_check::PlayerPermissionCheckEvent;
 use crate::plugin::player::player_teleport::PlayerTeleportEvent;
 use crate::plugin::server::packet::PacketSentEvent;
 use crate::server::Server;
-use crate::world::World;
+use crate::world::{BlockBreakingProgress, World};
 use bytes::Bytes;
 
 use super::breath::BreathManager;
@@ -249,7 +249,10 @@ impl ChunkManager {
         let old_view_distance = self.view_distance;
 
         {
-            let mut lock = level.chunk_loading.lock().unwrap();
+            let mut lock = level
+                .chunk_loading
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let new_level = ChunkLoading::get_level_from_view_distance(view_distance);
             lock.add_ticket(center, new_level);
 
@@ -308,7 +311,10 @@ impl ChunkManager {
     }
 
     pub fn clean_up(&mut self, level: &Arc<Level>) {
-        let mut lock = level.chunk_loading.lock().unwrap();
+        let mut lock = level
+            .chunk_loading
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         lock.remove_ticket(
             self.center,
             ChunkLoading::get_level_from_view_distance(self.view_distance),
@@ -327,7 +333,10 @@ impl ChunkManager {
     }
 
     pub fn change_world(&mut self, old_level: &Arc<Level>, new_world: Arc<World>) {
-        let mut lock = old_level.chunk_loading.lock().unwrap();
+        let mut lock = old_level
+            .chunk_loading
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         lock.remove_ticket(
             self.center,
             ChunkLoading::get_level_from_view_distance(self.view_distance),
@@ -466,6 +475,8 @@ pub struct Player {
     pub stats: Mutex<statistics::Statistics>,
     /// The current stage of block destruction of the block the player is breaking.
     pub current_block_destroy_stage: AtomicI32,
+    /// The per-tick block destruction progress last sent to Bedrock clients.
+    pub current_block_breaking_speed: AtomicU32,
     /// Indicates if the player is currently mining a block.
     pub mining: AtomicBool,
     pub start_mining_time: AtomicI32,
@@ -622,7 +633,10 @@ impl Player {
 
         impl ScreenHandlerListener for ScreenListener {}
 
-        let server = world.server.upgrade().unwrap();
+        let server = world.server.upgrade().unwrap_or_else(|| {
+            tracing::error!("server inactive");
+            std::process::exit(1);
+        });
 
         let player_uuid = gameprofile.id;
 
@@ -645,13 +659,8 @@ impl Player {
         let ender_chest_inventory = Arc::new(EnderChestInventory::new());
 
         let player_screen_handler = Arc::new(Mutex::new(
-            PlayerScreenHandler::new(
-                &inventory,
-                None,
-                0,
-                Some(world.server.upgrade().unwrap().recipe_manager.clone()),
-            )
-            .await,
+            PlayerScreenHandler::new(&inventory, None, 0, Some(server.recipe_manager.clone()))
+                .await,
         ));
 
         // Initialize abilities based on gamemode (like vanilla's GameMode.setAbilities())
@@ -682,6 +691,7 @@ impl Player {
             // TODO: Load this from previous instance
             hunger_manager: HungerManager::default(),
             current_block_destroy_stage: AtomicI32::new(-1),
+            current_block_breaking_speed: AtomicU32::new(0),
             enchantment_seed: AtomicI32::new(rand::random()),
             open_container: AtomicCell::new(None),
             open_container_pos: AtomicCell::new(None),
@@ -707,7 +717,7 @@ impl Player {
             watched_section: AtomicCell::new(Cylindrical::new(
                 Vector2::new(0, 0),
                 // Since 1 is not possible in vanilla it is used as uninit
-                NonZeroU8::new(1).unwrap(),
+                NonZeroU8::new(1).unwrap_or(NonZeroU8::MIN),
             )),
             last_action_time: AtomicCell::new(std::time::Instant::now()),
             ping: AtomicU32::new(0),
@@ -966,7 +976,9 @@ impl Player {
     #[expect(clippy::too_many_lines)]
     pub async fn attack(&self, victim: Arc<dyn EntityBase>) {
         let world = self.world();
-        let server = world.server.upgrade().unwrap();
+        let Some(server) = world.server.upgrade() else {
+            return;
+        };
         let victim_entity = victim.get_entity();
         let attacker_entity = &self.living_entity.entity;
         let config = &server.advanced_config.pvp;
@@ -2083,25 +2095,65 @@ impl Player {
         }
 
         if self.mining.load(Ordering::Relaxed) {
-            let pos = self.mining_pos.lock().await;
+            let pos = *self.mining_pos.lock().await;
             let world = self.world();
             let state = world.get_block_state(&pos);
             // Is the block broken?
             if state.is_air() {
                 world
-                    .set_block_breaking(&self.living_entity.entity, *pos, -1)
+                    .set_block_breaking(
+                        &self.living_entity.entity,
+                        pos,
+                        BlockBreakingProgress::Stop,
+                    )
                     .await;
                 self.current_block_destroy_stage
                     .store(-1, Ordering::Relaxed);
                 self.mining.store(false, Ordering::Relaxed);
             } else {
-                self.continue_mining(
-                    *pos,
-                    &world,
-                    state,
-                    self.start_mining_time.load(Ordering::Relaxed),
-                )
-                .await;
+                let finished = self
+                    .continue_mining(
+                        pos,
+                        &world,
+                        state,
+                        self.start_mining_time.load(Ordering::Relaxed),
+                    )
+                    .await;
+                if finished && matches!(self.client.as_ref(), ClientPlatform::Bedrock(_)) {
+                    self.mining.store(false, Ordering::Relaxed);
+                    self.current_block_destroy_stage
+                        .store(-1, Ordering::Relaxed);
+                    world
+                        .set_block_breaking(
+                            &self.living_entity.entity,
+                            pos,
+                            BlockBreakingProgress::Stop,
+                        )
+                        .await;
+
+                    let block = Block::from_state_id(state.id);
+                    let can_harvest = self.can_harvest(state, block).await;
+                    let flags = if can_harvest {
+                        pumpkin_world::world::BlockFlags::NOTIFY_NEIGHBORS
+                    } else {
+                        pumpkin_world::world::BlockFlags::SKIP_DROPS
+                            | pumpkin_world::world::BlockFlags::NOTIFY_NEIGHBORS
+                    };
+                    if world
+                        .break_block(&pos, Some(self.clone()), flags)
+                        .await
+                        .is_some()
+                    {
+                        server
+                            .block_registry
+                            .broken(&world, block, self, &pos, server, state)
+                            .await;
+                        self.apply_tool_damage_for_block_break(state).await;
+                        if can_harvest {
+                            self.add_exhaustion(MINE_BLOCK_EXHAUSTION).await;
+                        }
+                    }
+                }
             }
         }
         self.last_attacked_ticks.fetch_add(1, Ordering::Relaxed);
@@ -2147,18 +2199,31 @@ impl Player {
         world: &World,
         state: &BlockState,
         starting_time: i32,
-    ) {
+    ) -> bool {
         let time = self.tick_counter.load(Ordering::Relaxed) - starting_time;
-        let speed = block::calc_block_breaking(self, state, Block::from_state_id(state.id)).await
-            * (time + 1) as f32;
-        let progress = (speed * 10.0) as i32;
-        if progress != self.current_block_destroy_stage.load(Ordering::Relaxed) {
+        let speed = block::calc_block_breaking(self, state, Block::from_state_id(state.id)).await;
+        let total_progress = speed * (time + 1) as f32;
+        let stage = (total_progress * 10.0) as i32;
+        let stage = stage.min(9);
+        let old_speed = self
+            .current_block_breaking_speed
+            .swap(speed.to_bits(), Ordering::Relaxed);
+        let speed_changed = old_speed != speed.to_bits();
+        if stage != self.current_block_destroy_stage.load(Ordering::Relaxed) || speed_changed {
             world
-                .set_block_breaking(&self.living_entity.entity, location, progress)
+                .set_block_breaking(
+                    &self.living_entity.entity,
+                    location,
+                    BlockBreakingProgress::Update {
+                        stage,
+                        speed: speed_changed.then_some(speed),
+                    },
+                )
                 .await;
             self.current_block_destroy_stage
-                .store(progress, Ordering::Relaxed);
+                .store(stage, Ordering::Relaxed);
         }
+        total_progress >= 1.0
     }
 
     pub async fn jump(&self) {
@@ -2674,7 +2739,7 @@ impl Player {
 
         self.watched_section.store(Cylindrical::new(
             Vector2::new(0, 0),
-            NonZeroU8::new(1).unwrap(),
+            NonZeroU8::new(1).unwrap_or(NonZeroU8::MIN),
         ));
     }
 
@@ -2690,7 +2755,9 @@ impl Player {
         let yaw = yaw.unwrap_or(new_world.level_info.load().spawn_yaw);
         let pitch = pitch.unwrap_or(new_world.level_info.load().spawn_pitch);
 
-        let server = new_world.server.upgrade().unwrap();
+        let Some(server) = new_world.server.upgrade() else {
+            return;
+        };
 
         send_cancellable! {{
             server;
@@ -2712,7 +2779,9 @@ impl Player {
                 let new_world = event.new_world;
 
                 self.set_client_loaded(false);
-                let player = current_world.remove_player(self, false).await.unwrap();
+                let Some(player) = current_world.remove_player(self, false).await else {
+                    return;
+                };
                new_world.players.rcu(|current_list| {
                     let mut new_list = (**current_list).clone();
                     new_list.push(player.clone());
@@ -2804,7 +2873,9 @@ impl Player {
         // This is the ultra special magic code used to create the teleport id
         // This returns the old value
         // This operation wraps around on overflow.
-        let server = self.world().server.upgrade().unwrap();
+        let Some(server) = self.world().server.upgrade() else {
+            return;
+        };
         send_cancellable! {{
             server;
             PlayerTeleportEvent {
@@ -3165,7 +3236,9 @@ impl Player {
         if self.gamemode.load() == gamemode {
             return false;
         }
-        let server = self.world().server.upgrade().unwrap();
+        let Some(server) = self.world().server.upgrade() else {
+            return false;
+        };
         send_cancellable! {{
             server;
             PlayerGamemodeChangeEvent {
@@ -3992,9 +4065,7 @@ impl Player {
         {
             let screen_handler_temp = screen_handler.lock().await;
             let sync_id = screen_handler_temp.sync_id();
-            let window_type = screen_handler_temp
-                .window_type()
-                .expect("Can't open PlayerScreenHandler");
+            let window_type = screen_handler_temp.window_type()?;
 
             let display_name = screen_handler_factory.get_display_name();
             let java_packet =
@@ -4060,9 +4131,9 @@ impl Player {
 
         let screen_handler_temp = screen_handler.lock().await;
         let sync_id = screen_handler_temp.sync_id();
-        let window_type = screen_handler_temp
-            .window_type()
-            .expect("Can't open PlayerScreenHandler");
+        let Some(window_type) = screen_handler_temp.window_type() else {
+            return;
+        };
 
         let java_packet = COpenScreen::new(sync_id.into(), (window_type as i32).into(), &title);
 
@@ -4917,7 +4988,9 @@ impl EntityBase for Player {
                 // Same world
                 let yaw = yaw.unwrap_or(self.living_entity.entity.yaw.load());
                 let pitch = pitch.unwrap_or(self.living_entity.entity.pitch.load());
-                let server = self.world().server.upgrade().unwrap();
+                let Some(server) = self.world().server.upgrade() else {
+                    return;
+                };
                 send_cancellable! {{
                     server;
                     PlayerTeleportEvent {

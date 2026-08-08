@@ -692,6 +692,46 @@ impl World {
         Self::broadcast_java_grouped(je_packet, recipients_by_version);
     }
 
+    /// Broadcasts the skin layers of a player, encoding the metadata for each Java client's own
+    /// protocol version since the tracked data index differs between versions.
+    fn broadcast_skin_parts_sync<B: BClientPacket>(
+        &self,
+        except: &[uuid::Uuid],
+        entity_id: i32,
+        skin_parts: u8,
+        be_packet: &B,
+    ) {
+        for p in self.players.load().iter() {
+            if except.contains(&p.gameprofile.id) {
+                continue;
+            }
+            match p.client.as_ref() {
+                ClientPlatform::Java(client) => {
+                    let version = client.version.load();
+                    let mut buf = Vec::new();
+                    for meta in [
+                        Metadata::new(
+                            TrackedData::PLAYER_MODE_CUSTOMISATION,
+                            MetaDataType::BYTE,
+                            skin_parts,
+                        ),
+                        Metadata::new(
+                            TrackedData::PLAYER_MODE_CUSTOMIZATION_ID,
+                            MetaDataType::BYTE,
+                            skin_parts,
+                        ),
+                    ] {
+                        meta.write(&mut buf, &version).unwrap();
+                    }
+                    buf.put_u8(255);
+                    client
+                        .try_enqueue_packet(&CSetEntityMetadata::new(entity_id.into(), buf.into()));
+                }
+                ClientPlatform::Bedrock(be_client) => be_client.try_enqueue_packet(be_packet),
+            }
+        }
+    }
+
     pub async fn broadcast_packet_except_editioned<J: ClientPacket, B: BClientPacket>(
         &self,
         except: &[uuid::Uuid],
@@ -1128,14 +1168,8 @@ impl World {
     async fn tick_environment(&self) {
         let (world_age, is_night, time_of_day) = {
             let mut level_time = self.level_time.lock().await;
-            let (advance_time, advance_weather) = {
-                let lock = self.level_info.load();
-                (
-                    lock.game_rules.advance_time,
-                    lock.game_rules.advance_weather,
-                )
-            };
-            level_time.tick_time(advance_time, advance_weather);
+            let advance_time = self.level_info.load().game_rules.advance_time;
+            level_time.tick(advance_time);
 
             // Auto-save logic
             if level_time.world_age % 100 == 0 {
@@ -2254,14 +2288,14 @@ impl World {
         client
             .send_game_packet(&CInventoryContent {
                 container_id: VarUInt(0), // player inventory,
-                slots: futures::future::join_all(player.inventory.main_inventory.iter().map(
-                    async |s| {
-                        let stack = s.lock().await;
-
-                        NetworkItemStackDescriptor::from(&*stack)
-                    },
-                ))
-                .await,
+                slots: player
+                    .inventory()
+                    .main_inventory
+                    .read()
+                    .await
+                    .iter()
+                    .map(NetworkItemStackDescriptor::from)
+                    .collect(),
                 full_container_name: FullContainerName {
                     container_name: ContainerName::Inventory,
                     dynamic_id: None,
@@ -2471,31 +2505,12 @@ impl World {
         );
 
         // Broadcast metadata to Java players so they can correctly interact with the new player
-        let config = player.config.load();
-        let mut java_meta_buf = Vec::new();
-        {
-            let meta = Metadata::new(
-                TrackedData::PLAYER_MODE_CUSTOMISATION,
-                MetaDataType::BYTE,
-                config.skin_parts,
-            );
-            meta.write(&mut java_meta_buf, &JavaMinecraftVersion::V_1_21_4)
-                .unwrap();
-        };
-        {
-            let meta = Metadata::new(
-                TrackedData::PLAYER_MODE_CUSTOMIZATION_ID,
-                MetaDataType::BYTE,
-                config.skin_parts,
-            );
-            meta.write(&mut java_meta_buf, &JavaMinecraftVersion::V_1_21_4)
-                .unwrap();
-        };
-        java_meta_buf.put_u8(255);
+        let skin_parts = player.config.load().skin_parts;
 
-        self.broadcast_packet_except_editioned_sync(
+        self.broadcast_skin_parts_sync(
             &[gameprofile.id],
-            &CSetEntityMetadata::new((runtime_id as i32).into(), java_meta_buf.into()),
+            runtime_id as i32,
+            skin_parts,
             &actor_data,
         );
 
@@ -2939,31 +2954,12 @@ impl World {
         );
 
         // Broadcast metadata to Java players so they can correctly interact with the new player
-        let config = player.config.load();
-        let mut java_meta_buf = Vec::new();
-        {
-            let meta = Metadata::new(
-                TrackedData::PLAYER_MODE_CUSTOMISATION,
-                MetaDataType::BYTE,
-                config.skin_parts,
-            );
-            meta.write(&mut java_meta_buf, &JavaMinecraftVersion::V_1_21_4)
-                .unwrap();
-        };
-        {
-            let meta = Metadata::new(
-                TrackedData::PLAYER_MODE_CUSTOMIZATION_ID,
-                MetaDataType::BYTE,
-                config.skin_parts,
-            );
-            meta.write(&mut java_meta_buf, &JavaMinecraftVersion::V_1_21_4)
-                .unwrap();
-        };
-        java_meta_buf.put_u8(255);
+        let skin_parts = player.config.load().skin_parts;
 
-        self.broadcast_packet_except_editioned_sync(
+        self.broadcast_skin_parts_sync(
             &[gameprofile.id],
-            &CSetEntityMetadata::new((entity_id).into(), java_meta_buf.into()),
+            entity_id,
+            skin_parts,
             &CSetActorData {
                 actor_runtime_id: VarULong(entity_id as u64),
                 metadata: player.get_entity().bedrock_metadata(),
@@ -3133,18 +3129,12 @@ impl World {
 
                 equipment_list.push((
                     EquipmentSlot::MAIN_HAND.discriminant(),
-                    existing_player.inventory.held_item().lock().await.clone(),
+                    existing_player.inventory.held_item().await,
                 ));
 
-                for (slot, item_arc_mutex) in &existing_player
-                    .inventory
-                    .entity_equipment
-                    .lock()
-                    .await
-                    .equipment
-                {
-                    let item_stack = item_arc_mutex.lock().await.clone();
-                    equipment_list.push((slot.discriminant(), item_stack));
+                let equipment_guard = existing_player.inventory.entity_equipment.lock().await;
+                for (slot, item_stack) in &equipment_guard.equipment {
+                    equipment_list.push((slot.discriminant(), item_stack.clone()));
                 }
 
                 let equipment: Vec<(i8, ItemStackSerializer)> = equipment_list
@@ -3277,12 +3267,12 @@ impl World {
 
         equipment_list.push((
             EquipmentSlot::MAIN_HAND.discriminant(),
-            from.inventory.held_item().lock().await.clone(),
+            from.inventory.held_item().await,
         ));
 
-        for (slot, item_arc_mutex) in &from.inventory.entity_equipment.lock().await.equipment {
-            let item_stack = item_arc_mutex.lock().await.clone();
-            equipment_list.push((slot.discriminant(), item_stack));
+        let equipment_guard = from.inventory.entity_equipment.lock().await;
+        for (slot, item_stack) in &equipment_guard.equipment {
+            equipment_list.push((slot.discriminant(), item_stack.clone()));
         }
 
         let equipment: Vec<(i8, ItemStackSerializer)> = equipment_list
@@ -4669,11 +4659,10 @@ impl World {
             if !flags.contains(BlockFlags::SKIP_DROPS) {
                 let tool = if let Some(player) = &cause {
                     let hand_stack = player
-                        .inventory
+                        .inventory()
                         .get_stack_in_hand(pumpkin_util::Hand::Right)
                         .await;
-                    let stack_guard = hand_stack.lock().await;
-                    (stack_guard.item_count > 0).then(|| stack_guard.clone())
+                    (!hand_stack.is_empty()).then_some(hand_stack)
                 } else {
                     None
                 };

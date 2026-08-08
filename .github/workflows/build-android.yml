@@ -1,0 +1,41 @@
+name: Build Android
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Setup Java (for NDK installation)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android NDK (r26b)
+        uses: nsetup/setup-android-ndk@v1
+        with:
+          ndk-version: r26b
+          link-to-sdk: true
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Build with cargo-ndk
+        run: |
+          cargo ndk -t arm64-v8a -p 21 build --release
+          

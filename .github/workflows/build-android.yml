@@ -27,10 +27,11 @@ jobs:
           java-version: '17'
 
       - name: Setup Android NDK (r26b)
-        uses: nsetup/setup-android-ndk@v1
+        uses: nndungx/setup-android-ndk@v1
         with:
           ndk-version: r26b
           link-to-sdk: true
+
 
       - name: Install cargo-ndk
         run: cargo install cargo-ndk

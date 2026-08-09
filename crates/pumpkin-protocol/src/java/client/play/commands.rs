@@ -256,14 +256,14 @@ impl ArgumentType {
             match id {
                 ..=16 => id,
                 18..=46 => id - 1,
-                48..=53 => id - 2,
-                55.. => id - 3,
+                49..=54 => id - 2,
+                56.. => id - 3,
 
                 // Fallbacks:
                 // 17 HexColor => String
-                // 47 ResourceSelector => String
-                // 54 Dialog => String
-                17 | 47 | 54 => 5,
+                // 48 ResourceSelector => String
+                // 55 Dialog => String
+                17 | 48 | 55 => 5,
             }
         } else if version < &JavaMinecraftVersion::V_1_21_6 {
             match id {

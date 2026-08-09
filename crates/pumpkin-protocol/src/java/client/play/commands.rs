@@ -261,6 +261,7 @@ impl ArgumentType {
 
                 // Fallbacks:
                 // 17 HexColor => String
+                // 47 ResourceKey => String
                 // 48 ResourceSelector => String
                 // 55 Dialog => String
                 17 | 48 | 55 => 5,

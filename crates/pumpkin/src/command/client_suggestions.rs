@@ -152,11 +152,6 @@ pub async fn send_c_commands_packet(
     }
 
     let packet = CCommands::new(proto_nodes.into(), VarInt(root_node_index as i32));
-
-    let mut bytes = Vec::new();
-    packet.write_packet_data(&mut bytes, &player.client.version());
-    eprintln!("CCommands hex: {}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>());
-
     player.client.enqueue_packet(&packet).await;
 }
 

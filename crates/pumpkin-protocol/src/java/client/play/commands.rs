@@ -288,7 +288,10 @@ impl ArgumentType {
         version: &JavaMinecraftVersion,
     ) -> Result<(), WritingError> {
         let id = self.to_id(version);
-        eprintln!("Writing ArgumentType {self:?} as id {id} for version {version:?}");
+        #[allow(clippy::print_stderr)]
+        {
+            eprintln!("Writing ArgumentType {self:?} as id {id} for version {version:?}");
+        }
         write.write_var_int(&(id).into())?;
         match self {
             Self::Float { min, max } => Self::write_number_arg(*min, *max, write),

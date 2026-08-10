@@ -152,6 +152,23 @@ pub async fn send_c_commands_packet(
     }
 
     let packet = CCommands::new(proto_nodes.into(), VarInt(root_node_index as i32));
+    
+    // DEBUG: Serialize and hex-dump the packet bytes before sending to catch encoder bugs
+    {
+        use pumpkin_protocol::serial::PacketWrite;
+        let mut debug_buf = Vec::new();
+        if let Err(e) = packet.write_packet_data(&mut debug_buf, &player.client.version.load()) {
+            eprintln!("CCommands serialization error: {e:?}");
+        } else {
+            let hex_str = debug_buf.iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!("CCommands packet ({} bytes, {} nodes, root_idx={}): {}", 
+                debug_buf.len(), proto_nodes.len(), root_node_index, hex_str);
+        }
+    }
+    
     player.client.enqueue_packet(&packet).await;
 }
 

@@ -288,7 +288,7 @@ impl ArgumentType {
         version: &JavaMinecraftVersion,
     ) -> Result<(), WritingError> {
         let id = self.to_id(version);
-        log::debug!("Writing ArgumentType {self:?} as id {id} for version {version:?}");
+        eprintln!("Writing ArgumentType {self:?} as id {id} for version {version:?}");
         write.write_var_int(&(id).into())?;
         match self {
             Self::Float { min, max } => Self::write_number_arg(*min, *max, write),
@@ -404,3 +404,4 @@ impl SuggestionProviders {
         }
     }
 }
+                

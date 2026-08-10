@@ -93,7 +93,7 @@ impl ProtoNode<'_> {
                 restricted,
             } => {
                 let mut n = 1;
-                if restricted {
+                if restricted && version >= &JavaMinecraftVersion::V_1_21_6 {
                     n |= Self::FLAG_IS_RESTRICTED;
                 }
                 if is_executable {
@@ -114,7 +114,7 @@ impl ProtoNode<'_> {
                 restricted,
             } => {
                 let mut n = 2;
-                if restricted {
+                if restricted && version >= &JavaMinecraftVersion::V_1_21_6 {
                     n |= Self::FLAG_IS_RESTRICTED;
                 }
                 if override_suggestion_type.is_some() {
@@ -268,13 +268,13 @@ impl ArgumentType {
         } else if version < &JavaMinecraftVersion::V_1_21_6 {
             match id {
                 ..=16 => id,
-                18..=53 => id - 1,
-                55.. => id - 2,
+                18..=54 => id - 1,
+                56.. => id - 2,
 
                 // Fallbacks:
                 // 17 HexColor => String
-                // 54 Dialog => String
-                17 | 54 => 5,
+                // 55 Dialog => String
+                17 | 55 => 5,
             }
         } else {
             id
@@ -288,6 +288,7 @@ impl ArgumentType {
         version: &JavaMinecraftVersion,
     ) -> Result<(), WritingError> {
         let id = self.to_id(version);
+        log::debug!("Writing ArgumentType {self:?} as id {id} for version {version:?}");
         write.write_var_int(&(id).into())?;
         match self {
             Self::Float { min, max } => Self::write_number_arg(*min, *max, write),

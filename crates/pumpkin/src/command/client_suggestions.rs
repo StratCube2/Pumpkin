@@ -157,7 +157,7 @@ pub async fn send_c_commands_packet(
     {
         use pumpkin_protocol::ClientPacket;
         let mut debug_buf = Vec::new();
-        if let Err(e) = packet.write_packet_data(&mut debug_buf, &player.client.version.load()) {
+        if let Err(e) = packet.write_packet_data(&mut debug_buf, &player.client.version()) {
             eprintln!("CCommands serialization error: {e:?}");
         } else {
             let hex_str = debug_buf

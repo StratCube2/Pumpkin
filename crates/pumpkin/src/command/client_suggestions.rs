@@ -579,7 +579,6 @@ fn ensure_enum_value(enum_values: &mut Vec<String>, value: &str) -> usize {
             enum_values.len() - 1
         })
 }
-
 fn ensure_command_enum(
     enums: &mut Vec<CommandEnum>,
     enum_values: &mut Vec<String>,
@@ -589,20 +588,16 @@ fn ensure_command_enum(
     if let Some(pos) = enums.iter().position(|e| e.name == name) {
         return pos;
     }
-
     let value_indices: Vec<usize> = values
         .iter()
         .map(|val| ensure_enum_value(enum_values, val))
         .collect();
-
     enums.push(CommandEnum {
         name: name.to_string(),
         value_indices,
     });
-
     enums.len() - 1
 }
-
 const fn bedrock_param_type(arg: &ArgumentType) -> u32 {
     let base = match arg {
         ArgumentType::Integer { .. } | ArgumentType::Long { .. } | ArgumentType::Time { .. } => {

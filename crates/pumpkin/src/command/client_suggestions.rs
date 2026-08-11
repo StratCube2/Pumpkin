@@ -149,29 +149,9 @@ pub async fn send_c_commands_packet(
         let mut first = std::mem::take(&mut root_node.children).into_vec();
         first.append(&mut root_node_children_second.into_vec());
         root_node.children = first.into_boxed_slice();
-    } 
-    let packet = CCommands::new(proto_nodes.into(), VarInt(root_node_index as i32));   
-    // DEBUG: Serialize and hex-dump the packet bytes before sending to catch encoder bugs
-    {
-        use pumpkin_protocol::ClientPacket;
-        let mut debug_buf = Vec::new();
-        if let Err(e) = packet.write_packet_data(&mut debug_buf, &player.client.java_version()) {
-            eprintln!("CCommands serialization error: {e:?}");
-        } else {
-            let hex_str = debug_buf
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            eprintln!(
-                "CCommands packet ({} bytes, root_idx={}): {}",
-                debug_buf.len(),
-                root_node_index,
-                hex_str
-            );
-        }
     }
-
+    
+    let packet = CCommands::new(proto_nodes.into(), VarInt(root_node_index as i32));
     player.client.enqueue_packet(&packet).await;
 }
 

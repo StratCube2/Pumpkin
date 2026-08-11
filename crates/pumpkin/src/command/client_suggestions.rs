@@ -143,18 +143,15 @@ pub async fn send_c_commands_packet(
             }
         }
     }
-
     if !root_node_children_second.is_empty() {
         let root_node = &mut proto_nodes[root_node_index];
         let mut first = std::mem::take(&mut root_node.children).into_vec();
         first.append(&mut root_node_children_second.into_vec());
         root_node.children = first.into_boxed_slice();
     }
-    
     let packet = CCommands::new(proto_nodes.into(), VarInt(root_node_index as i32));
     player.client.enqueue_packet(&packet).await;
 }
-
 fn resolve_node_id(node_id: NodeId, node_id_offset: usize, root_node_index: usize) -> usize {
     if node_id == ROOT_NODE_ID {
         root_node_index

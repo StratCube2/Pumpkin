@@ -308,9 +308,7 @@ impl ArgumentType {
             // one of these, the client expects the `string_type` property byte that a
             // real `String` argument would send — write it here to match, using
             // GreedyPhrase since these accept arbitrary text/identifiers.
-            Self::HexColor | Self::ResourceSelector | Self::Dialog
-                if self.to_id(version) == 5 =>
-            {
+            Self::HexColor | Self::ResourceSelector | Self::Dialog if self.to_id(version) == 5 => {
                 write.write_var_int(&(StringProtoArgBehavior::GreedyPhrase as i32).into())
             }
             Self::Entity { flags } => Self::write_with_flags(*flags, write),

@@ -302,6 +302,15 @@ impl ArgumentType {
                 };
                 write.write_var_int(&i.into())
             }
+            // HexColor, ResourceSelector, and Dialog have no equivalent parser on clients
+            // older than 1.21.5/1.21.6 (see `to_id`), so they're sent as a fallback
+            // `brigadier:string` (wire id 5) argument. Whenever `to_id` reports id 5 for
+            // one of these, the client expects the `string_type` property byte that a
+            // real `String` argument would send — write it here to match, using
+            // GreedyPhrase since these accept arbitrary text/identifiers.
+            Self::HexColor | Self::ResourceSelector | Self::Dialog if self.to_id(version) == 5 => {
+                write.write_var_int(&(StringProtoArgBehavior::GreedyPhrase as i32).into())
+            }
             Self::Entity { flags } => Self::write_with_flags(*flags, write),
             Self::ScoreHolder { flags } => Self::write_with_flags(*flags, write),
             Self::Time { min } => write.write_i32_be(*min),

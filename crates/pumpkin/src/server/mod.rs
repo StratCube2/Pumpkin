@@ -52,6 +52,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::task::TaskTracker;
 
 mod connection_cache;
+pub mod enchantment;
 mod key_store;
 pub mod recipe;
 pub mod scheduler;
@@ -105,6 +106,7 @@ pub struct Server {
     /// Assigns unique IDs to containers.
     container_id: AtomicU32,
     pub recipe_manager: Arc<recipe::RecipeManager>,
+    pub enchantment_manager: Arc<enchantment::EnchantmentManager>,
     /// Assigns unique IDs to maps.
     map_id: AtomicI32,
     /// Mojang's public keys, used for chat session signing
@@ -154,8 +156,14 @@ impl Server {
     ) -> Arc<Self> {
         let permission_registry = Arc::new(RwLock::new(PermissionRegistry::new()));
         // First register the default commands. After that, plugins can put in their own.
-        let command_dispatcher =
-            RwLock::new(default_dispatcher(&permission_registry, &basic_config).await);
+        let command_dispatcher = RwLock::new(
+            default_dispatcher(
+                &permission_registry,
+                &basic_config,
+                &advanced_config.commands,
+            )
+            .await,
+        );
 
         crate::command::set_broadcast_console_to_ops(
             advanced_config.commands.broadcast_console_to_ops,
@@ -277,6 +285,7 @@ impl Server {
             permission_registry,
             container_id: 0.into(),
             recipe_manager: Arc::new(recipe::RecipeManager::new()),
+            enchantment_manager: Arc::new(enchantment::EnchantmentManager::new()),
             map_id: level_info.load().map_id.into(),
             worlds: ArcSwap::from_pointee(vec![]),
             dimensions,
@@ -364,6 +373,22 @@ impl Server {
             worlds_vec.push(world);
         }
 
+        for world in &worlds_vec {
+            let mut world_init_event =
+                crate::plugin::api::events::world::world_init::WorldInitEvent::new(world.clone());
+            server
+                .plugin_manager
+                .fire(&server, &mut world_init_event)
+                .await;
+
+            let mut world_load_event =
+                crate::plugin::api::events::world::world_load::WorldLoadEvent::new(world.clone());
+            server
+                .plugin_manager
+                .fire(&server, &mut world_load_event)
+                .await;
+        }
+
         server.worlds.store(Arc::new(worlds_vec));
         if let Ok(k) = keys {
             server.mojang_public_keys.store(Arc::new(k));
@@ -419,11 +444,12 @@ impl Server {
     pub async fn create_world(self: &Arc<Self>, name: String, dimension: Dimension) -> Arc<World> {
         {
             let worlds = self.worlds.load();
-            if let Some(world) = worlds
+            let world = worlds
                 .iter()
                 .find(|w| w.get_world_name() == name && w.dimension == dimension)
-            {
-                return world.clone();
+                .cloned();
+            if let Some(world) = world {
+                return world;
             }
         }
 
@@ -467,6 +493,61 @@ impl Server {
             error!("World creation failed");
             std::process::exit(1);
         })
+    }
+
+    pub async fn unload_world(&self, name: &str) -> Result<(), String> {
+        let worlds = self.worlds.load();
+        let world_to_unload = worlds
+            .iter()
+            .find(|w| w.get_world_name() == name || w.dimension.minecraft_name == name)
+            .cloned()
+            .ok_or_else(|| format!("World '{name}' not found"))?;
+
+        if let Some(first_world) = worlds.first()
+            && Arc::ptr_eq(first_world, &world_to_unload)
+        {
+            return Err("Cannot unload the primary/default world".to_string());
+        }
+
+        let player_count = world_to_unload.players.load().len();
+        if player_count > 0 {
+            return Err(format!(
+                "Cannot unload world '{name}': {player_count} players are still in this world"
+            ));
+        }
+
+        world_to_unload.shutdown().await;
+        world_to_unload.unload().await;
+
+        self.worlds.rcu(|w_list| {
+            let mut new_list = (**w_list).clone();
+            new_list.retain(|w| !Arc::ptr_eq(w, &world_to_unload));
+            new_list
+        });
+
+        Ok(())
+    }
+
+    pub async fn save_all(&self) -> Result<(), String> {
+        if let Err(err) = self.player_data_storage.save_all_players(self).await {
+            error!("Failed to save player data: {err}");
+            return Err(format!("Failed to save player data: {err}"));
+        }
+
+        if let Err(err) = self
+            .advancement_manager
+            .save_all_players(&self.get_all_players())
+            .await
+        {
+            error!("Failed to save player advancements: {err}");
+            return Err(format!("Failed to save player advancements: {err}"));
+        }
+
+        for world in self.worlds.load().iter() {
+            world.save().await;
+        }
+
+        Ok(())
     }
 
     /// Adds a new player to the server.
@@ -534,6 +615,9 @@ impl Server {
 
         if let Some(mut nbt_data) = nbt {
             player.read_nbt(&mut nbt_data).await;
+            // The data file itself proves this is a returning player. Older Bedrock
+            // sessions could persist HasPlayedBefore as false and mask a valid Pos.
+            player.has_played_before.store(true, Ordering::Relaxed);
         }
 
         // Wrap in Arc after data is loaded
@@ -1021,9 +1105,7 @@ impl Server {
                 .map_or_else(Vec::new, |player| vec![player]),
         };
 
-        let Some(player_type) = EntityType::from_name("player") else {
-            return Vec::new();
-        };
+        let player_type = &EntityType::PLAYER;
         let type_included = target_selector
             .conditions
             .iter()
@@ -1199,5 +1281,50 @@ impl Server {
                 entities.into_iter().take(limit).collect()
             }
         }
+    }
+
+    pub async fn execute_remote_command(self: &Arc<Self>, command: String) {
+        let mut remote_event = crate::plugin::api::events::server::remote_server_command::RemoteServerCommandEvent::new(
+            command,
+        );
+        self.plugin_manager.fire(self, &mut remote_event).await;
+    }
+
+    pub async fn register_service(self: &Arc<Self>, service_name: String) {
+        let mut service_event =
+            crate::plugin::api::events::server::service_register::ServiceRegisterEvent::new(
+                service_name,
+            );
+        self.plugin_manager.fire(self, &mut service_event).await;
+    }
+
+    pub async fn unregister_service(self: &Arc<Self>, service_name: String) {
+        let mut service_event =
+            crate::plugin::api::events::server::service_unregister::ServiceUnregisterEvent::new(
+                service_name,
+            );
+        self.plugin_manager.fire(self, &mut service_event).await;
+    }
+
+    pub async fn tab_complete(self: &Arc<Self>, buffer: String, completions: Vec<String>) {
+        let mut tab_event = crate::plugin::api::events::server::tab_complete::TabCompleteEvent::new(
+            buffer,
+            completions,
+        );
+        self.plugin_manager.fire(self, &mut tab_event).await;
+    }
+
+    pub async fn enable_plugin(self: &Arc<Self>, plugin_name: String) {
+        let mut enable_event =
+            crate::plugin::api::events::server::plugin_enable::PluginEnableEvent::new(plugin_name);
+        self.plugin_manager.fire(self, &mut enable_event).await;
+    }
+
+    pub async fn disable_plugin(self: &Arc<Self>, plugin_name: String) {
+        let mut disable_event =
+            crate::plugin::api::events::server::plugin_disable::PluginDisableEvent::new(
+                plugin_name,
+            );
+        self.plugin_manager.fire(self, &mut disable_event).await;
     }
 }

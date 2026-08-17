@@ -32,6 +32,10 @@ pub async fn send_c_commands_packet(
 
     let fallback_dispatcher = &dispatcher.fallback_dispatcher;
     for key in fallback_dispatcher.commands.keys() {
+        if dispatcher.is_disabled(key) {
+            continue;
+        }
+
         let Ok(tree) = fallback_dispatcher.get_tree(key) else {
             continue;
         };
@@ -78,20 +82,42 @@ pub async fn send_c_commands_packet(
             .values()
             .copied()
             .map(|id| resolve_node_id(id, node_id_offset, root_node_index))
-            .map(|i| i.try_into().expect("i32 limit reached for ids"))
+            .map(|i| VarInt(i as i32))
             .collect();
 
         let redirect_target = node
             .redirect()
             .and_then(|redirection| dispatcher.tree.resolve(redirection))
-            .map(|id| resolve_node_id(id, node_id_offset, root_node_index))
-            .map(|i| i.try_into().expect("i32 limit reached for ids"));
+            .map(|id| resolve_node_id(id, node_id_offset, root_node_index) as i32);
 
         let satisfies_requirements = true;
 
         match node {
             AttachedNode::Root(_) => {
-                root_node_children_second = children;
+                // Drop disabled commands from the root's child list so they
+                // disappear from the client's command graph (and tab-completion)
+                // entirely. The nodes themselves stay in `proto_nodes` to keep
+                // every other node's indices valid; they simply become
+                // unreachable.
+                root_node_children_second = node
+                    .children_ref()
+                    .values()
+                    .copied()
+                    .filter(|id| {
+                        let disabled = match &dispatcher.tree[*id] {
+                            AttachedNode::Literal(child) => {
+                                dispatcher.is_disabled(&child.meta.literal_lowercase)
+                            }
+                            AttachedNode::Command(child) => {
+                                dispatcher.is_disabled(&child.meta.literal_lowercase)
+                            }
+                            _ => false,
+                        };
+                        !disabled
+                    })
+                    .map(|id| resolve_node_id(id, node_id_offset, root_node_index))
+                    .map(|i| VarInt(i as i32))
+                    .collect();
             }
             AttachedNode::Literal(literal_attached_node) => {
                 let node = ProtoNode {
@@ -178,11 +204,7 @@ impl<'a> ProtoNodeBuilder<'a> {
         let children: Box<[VarInt]> = self
             .child_nodes
             .into_iter()
-            .map(|node| {
-                node.build(buffer)
-                    .try_into()
-                    .expect("Buffer index exceeded i32 bounds")
-            })
+            .map(|node| VarInt(node.build(buffer) as i32))
             .collect();
 
         let i = buffer.len();
@@ -272,6 +294,10 @@ pub async fn send_bedrock_commands_packet(
 
     let fallback_dispatcher = &dispatcher.fallback_dispatcher;
     for key in fallback_dispatcher.commands.keys() {
+        if dispatcher.is_disabled(key) {
+            continue;
+        }
+
         let Ok(tree) = fallback_dispatcher.get_tree(key) else {
             continue;
         };
@@ -334,6 +360,10 @@ pub async fn send_bedrock_commands_packet(
             ),
             _ => continue,
         };
+
+        if dispatcher.is_disabled(&name.to_ascii_lowercase()) {
+            continue;
+        }
 
         let mut ctx = BuilderContext {
             enum_values: &mut enum_values,
@@ -553,14 +583,15 @@ fn collect_overloads_from_attached(
     }
 }
 
-fn ensure_enum_value(enum_values: &mut Vec<String>, value: &str) -> usize {
-    enum_values
+fn ensure_enum_value(enum_values: &mut Vec<String>, value: &str) -> u32 {
+    let index = enum_values
         .iter()
         .position(|v| v == value)
         .unwrap_or_else(|| {
             enum_values.push(value.to_string());
             enum_values.len() - 1
-        })
+        });
+    index as u32
 }
 
 fn ensure_command_enum(
@@ -573,7 +604,7 @@ fn ensure_command_enum(
         return pos;
     }
 
-    let value_indices: Vec<usize> = values
+    let value_indices: Vec<u32> = values
         .iter()
         .map(|val| ensure_enum_value(enum_values, val))
         .collect();

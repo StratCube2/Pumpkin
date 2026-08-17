@@ -666,7 +666,10 @@ impl CommandDispatcher {
         let mut names = tree.names.iter();
         let permission = permission.into();
 
-        let primary_name = names.next().expect("at least one name must be provided");
+        let Some(primary_name) = names.next() else {
+            tracing::warn!("Command registration skipped: command tree has no names");
+            return;
+        };
 
         for name in names {
             self.commands
@@ -727,8 +730,9 @@ mod test {
     #[tokio::test]
     async fn dynamic_command() {
         let config = BasicConfiguration::default();
+        let commands_config = pumpkin_config::CommandsConfig::default();
         let registry = RwLock::new(PermissionRegistry::new());
-        let mut dispatcher = default_dispatcher(&registry, &config)
+        let mut dispatcher = default_dispatcher(&registry, &config, &commands_config)
             .await
             .fallback_dispatcher;
         let tree = CommandTree::new(["test"], "test_desc");
@@ -738,8 +742,9 @@ mod test {
     #[tokio::test]
     async fn pumpkin_command_aliases() {
         let config = BasicConfiguration::default();
+        let commands_config = pumpkin_config::CommandsConfig::default();
         let registry = RwLock::new(PermissionRegistry::new());
-        let dispatcher = default_dispatcher(&registry, &config)
+        let dispatcher = default_dispatcher(&registry, &config, &commands_config)
             .await
             .fallback_dispatcher;
 
